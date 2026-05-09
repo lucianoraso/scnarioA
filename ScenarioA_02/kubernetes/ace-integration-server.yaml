@@ -1,0 +1,339 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ace-server-config
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+data:
+  # Backend Service URLs
+  ERP_SERVICE_URL: "http://erp-service.scenario-a-demo.svc.cluster.local:3001"
+  MES_SERVICE_URL: "http://mes-service.scenario-a-demo.svc.cluster.local:3002"
+  QMS_SERVICE_URL: "http://qms-service.scenario-a-demo.svc.cluster.local:3003"
+  
+  # Retry Configuration
+  MAX_RETRIES: "3"
+  RETRY_INITIAL_DELAY_MS: "1000"
+  RETRY_BACKOFF_MULTIPLIER: "2.0"
+  HTTP_TIMEOUT_SECONDS: "30"
+  
+  # Circuit Breaker Configuration
+  CIRCUIT_BREAKER_THRESHOLD: "5"
+  CIRCUIT_BREAKER_TIMEOUT_SECONDS: "60"
+  
+  # Feature Flags
+  ENABLE_PARTIAL_RESPONSES: "true"
+  ENABLE_CIRCUIT_BREAKER: "true"
+  ENABLE_DISTRIBUTED_TRACING: "true"
+  
+  # OAuth2 Configuration
+  OAUTH2_ENABLED: "false"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ace-server-secret
+  namespace: scenario-a-demo
+type: Opaque
+stringData:
+  OAUTH2_CLIENT_SECRET: "change-me-in-production"
+
+---
+# IntegrationServer Custom Resource per IBM Cloud Pak for Integration
+apiVersion: appconnect.ibm.com/v1beta1
+kind: IntegrationServer
+metadata:
+  name: order-orchestration-server
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+    app.kubernetes.io/name: ace-integration-server
+    app.kubernetes.io/component: integration
+    app.kubernetes.io/part-of: scenario-a-demo
+spec:
+  # ACE Version
+  version: 13.0.1.0-r1
+  
+  # License
+  license:
+    accept: true
+    license: L-MJTK-WUU8HE
+    use: CloudPakForIntegrationNonProduction
+  
+  # Replica Configuration
+  replicas: 2
+  
+  # Pod Configuration
+  pod:
+    containers:
+      runtime:
+        image: cp.icr.io/cp/appc/ace-server-prod@sha256:latest
+        imagePullPolicy: IfNotPresent
+        
+        # Resource Limits
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        
+        # Environment Variables from ConfigMap
+        env:
+          - name: ERP_SERVICE_URL
+            valueFrom:
+              configMapKeyRef:
+                name: ace-server-config
+                key: ERP_SERVICE_URL
+          - name: MES_SERVICE_URL
+            valueFrom:
+              configMapKeyRef:
+                name: ace-server-config
+                key: MES_SERVICE_URL
+          - name: QMS_SERVICE_URL
+            valueFrom:
+              configMapKeyRef:
+                name: ace-server-config
+                key: QMS_SERVICE_URL
+          - name: MAX_RETRIES
+            valueFrom:
+              configMapKeyRef:
+                name: ace-server-config
+                key: MAX_RETRIES
+          - name: CIRCUIT_BREAKER_THRESHOLD
+            valueFrom:
+              configMapKeyRef:
+                name: ace-server-config
+                key: CIRCUIT_BREAKER_THRESHOLD
+          - name: OAUTH2_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: ace-server-secret
+                key: OAUTH2_CLIENT_SECRET
+        
+        # Liveness Probe
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 7600
+            scheme: HTTP
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Readiness Probe
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 7600
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+    
+    # Security Context
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+  
+  # Service Configuration
+  service:
+    endpointType: http
+  
+  # Router Configuration
+  router:
+    timeout: 120s
+  
+  # Configurations
+  configurations:
+    - order-orchestration-config
+  
+  # BAR File URL
+  barURL: >-
+    https://github.com/your-org/scenario-a/releases/download/v1.0.0/OrderOrchestration.bar
+  
+  # Designator (for workload management)
+  designerFlowsOperationMode: disabled
+  
+  # Tracing
+  tracing:
+    enabled: true
+    namespace: observability
+  
+  # Metrics
+  metrics:
+    enabled: true
+  
+  # Log Format
+  logFormat: json
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ace-integration-server
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+    app.kubernetes.io/name: ace-integration-server
+    app.kubernetes.io/component: integration
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 7800
+      targetPort: 7800
+      protocol: TCP
+    - name: https
+      port: 7843
+      targetPort: 7843
+      protocol: TCP
+    - name: admin
+      port: 7600
+      targetPort: 7600
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: order-orchestration-server
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ace-integration-server
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+spec:
+  to:
+    kind: Service
+    name: ace-integration-server
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ace-admin-ui
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+spec:
+  to:
+    kind: Service
+    name: ace-integration-server
+    weight: 100
+  port:
+    targetPort: admin
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ace-integration-server-hpa
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+spec:
+  scaleTargetRef:
+    apiVersion: appconnect.ibm.com/v1beta1
+    kind: IntegrationServer
+    name: order-orchestration-server
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-orchestration-config
+  namespace: scenario-a-demo
+data:
+  server.conf.yaml: |
+    ServerConf:
+      serverName: 'OrderOrchestrationServer'
+      HTTPListener:
+        port: 7800
+        host: '0.0.0.0'
+      Logging:
+        consoleLog: true
+        consoleFormat: 'json'
+        consoleLogLevel: 'info'
+      Monitoring:
+        MessageFlow:
+          publicationOn: 'active'
+      Statistics:
+        Snapshot:
+          publicationOn: 'active'
+          outputFormat: 'json'
+      Tracing:
+        enabled: true
+        endpoint: 'http://jaeger-collector.observability.svc.cluster.local:14268/api/traces'
+        serviceName: 'order-orchestration-service'
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ace-integration-server
+  namespace: scenario-a-demo
+  labels:
+    app: ace-integration-server
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: order-orchestration-server
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 30s
+      scheme: http
+
+# Made with Bob

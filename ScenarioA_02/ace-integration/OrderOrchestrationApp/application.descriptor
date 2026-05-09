@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns2:appDescriptor xmlns="http://com.ibm.etools.mft.descriptor.base" xmlns:ns2="http://com.ibm.etools.mft.descriptor.app">
+    <ns2:application>
+        <name>OrderOrchestrationApp</name>
+        <version>1.0.0</version>
+        <description>Application for orchestrating ERP, MES, and QMS backend services</description>
+        <projects>
+            <project>OrderOrchestrationLib</project>
+        </projects>
+    </ns2:application>
+</ns2:appDescriptor>
+
+<!-- Made with Bob -->

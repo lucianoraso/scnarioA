@@ -1,0 +1,581 @@
+openapi: 3.0.3
+info:
+  title: Order Management Consolidated API
+  description: |
+    API consolidata per la gestione ordini che orchestra chiamate ai sistemi ERP, MES e QMS.
+    
+    Questa API fornisce una vista unificata dei dati di ordine provenienti da tre sistemi backend:
+    - **ERP**: Dati ordine e informazioni finanziarie
+    - **MES**: Step di produzione e avanzamento
+    - **QMS**: Controlli qualità e risultati
+    
+    ## Caratteristiche
+    - Orchestrazione sincrona multi-sistema
+    - Trasformazione dati in modello canonico
+    - Gestione errori con retry e circuit breaker
+    - Supporto risposte parziali in caso di fallimenti
+    - OAuth2 authentication
+    - Rate limiting
+    
+    ## Pattern Implementati
+    - VETRO (Validate, Enrich, Transform, Route, Operate)
+    - Circuit Breaker
+    - Retry con Exponential Backoff
+    - Partial Response Handling
+  version: 1.0.0
+  contact:
+    name: IBM Cloud Pak for Integration Team
+    email: support@ibm.com
+  license:
+    name: IBM License
+    url: https://www.ibm.com/licensing
+
+servers:
+  - url: https://api-gateway.apps.cluster.example.com/scenario-a
+    description: Production API Gateway
+  - url: https://api-gateway-dev.apps.cluster.example.com/scenario-a
+    description: Development API Gateway
+  - url: http://localhost:7800
+    description: Local ACE Integration Server
+
+tags:
+  - name: Orders
+    description: Operazioni sugli ordini consolidati
+  - name: Health
+    description: Health check endpoints
+
+paths:
+  /api/v1/orders/{orderId}:
+    get:
+      tags:
+        - Orders
+      summary: Ottieni dettagli ordine consolidato
+      description: |
+        Recupera i dettagli completi di un ordine orchestrando chiamate a ERP, MES e QMS.
+        
+        **Flusso di orchestrazione:**
+        1. Valida orderId
+        2. Chiama ERP per dati ordine
+        3. Chiama MES per step produzione
+        4. Chiama QMS per controlli qualità
+        5. Trasforma in modello canonico
+        6. Restituisce risposta consolidata
+        
+        **Gestione errori:**
+        - Se ERP fallisce: errore 503 (dati ordine essenziali)
+        - Se MES fallisce: risposta parziale con warning
+        - Se QMS fallisce: risposta parziale con warning
+      operationId: getOrderById
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: ID univoco dell'ordine (formato ORD-YYYY-NNN)
+          schema:
+            type: string
+            pattern: '^ORD-\d{4}-\d{3}$'
+            example: ORD-2026-001
+        - name: X-Request-ID
+          in: header
+          required: false
+          description: ID univoco per tracciamento richiesta
+          schema:
+            type: string
+            format: uuid
+        - name: X-Correlation-ID
+          in: header
+          required: false
+          description: ID per correlazione tra richieste
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Ordine recuperato con successo
+          headers:
+            X-Response-Time:
+              description: Tempo di risposta in millisecondi
+              schema:
+                type: string
+            X-Request-ID:
+              description: ID richiesta
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsolidatedOrder'
+              examples:
+                complete:
+                  summary: Risposta completa
+                  value:
+                    order:
+                      orderId: ORD-2026-001
+                      orderNumber: PO-2026-001234
+                      status: IN_PROGRESS
+                      priority: HIGH
+                      customer:
+                        name: Leonardo S.p.A.
+                        id: CUST-001
+                      plant:
+                        code: TOR
+                        name: Stabilimento Torino
+                      financial:
+                        totalAmount: 1250000.00
+                        currency: EUR
+                      dates:
+                        orderDate: "2026-01-15T00:00:00Z"
+                        requestedDeliveryDate: "2026-06-30T00:00:00Z"
+                      product:
+                        code: PROD-AER-001
+                        description: Componente Aeronautico
+                      quantity:
+                        ordered: 100
+                        unit: PCS
+                      production:
+                        summary:
+                          totalSteps: 10
+                          completedSteps: 4
+                          completionPercentage: 40.0
+                        steps:
+                          - stepId: 1
+                            stepNumber: 1
+                            stepName: Preparazione Materiali
+                            status: COMPLETED
+                      quality:
+                        summary:
+                          totalChecks: 15
+                          passedChecks: 13
+                          passRate: 86.67
+                          overallStatus: PASSED
+                        checks:
+                          - checkId: 1
+                            checkType: Verifica Materiale
+                            result: PASS
+                    metadata:
+                      orchestrationTimestamp: "2026-05-08T15:00:00Z"
+                      version: "1.0.0"
+                    _links:
+                      self:
+                        href: /api/v1/orders/ORD-2026-001
+                partial:
+                  summary: Risposta parziale (QMS non disponibile)
+                  value:
+                    order:
+                      orderId: ORD-2026-001
+                      status: IN_PROGRESS
+                      production:
+                        summary:
+                          totalSteps: 10
+                    warnings:
+                      - service: QMS
+                        message: Service temporarily unavailable
+                        severity: WARNING
+                    metadata:
+                      partialData: true
+                      failedServices: QMS
+        '400':
+          description: Richiesta non valida
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: VALIDATION_ERROR
+                  message: Invalid orderId format
+                  details: Expected format ORD-YYYY-NNN
+        '401':
+          description: Non autenticato
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Non autorizzato
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Ordine non trovato
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: NOT_FOUND
+                  message: Order not found
+                  details: Order ORD-2026-999 does not exist
+        '429':
+          description: Troppi richieste (rate limit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Servizio non disponibile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error:
+                  code: SERVICE_UNAVAILABLE
+                  message: Backend service temporarily unavailable
+                  details: ERP service is not responding
+      security:
+        - OAuth2:
+            - orders:read
+
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Verifica stato del servizio
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Servizio operativo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  timestamp:
+                    type: string
+                    format: date-time
+      security: []
+
+components:
+  schemas:
+    ConsolidatedOrder:
+      type: object
+      required:
+        - order
+        - metadata
+      properties:
+        order:
+          $ref: '#/components/schemas/Order'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Warning'
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+        _links:
+          $ref: '#/components/schemas/Links'
+
+    Order:
+      type: object
+      properties:
+        orderId:
+          type: string
+        orderNumber:
+          type: string
+        status:
+          type: string
+          enum: [CREATED, IN_PROGRESS, COMPLETED, ON_HOLD, CANCELLED]
+        priority:
+          type: string
+          enum: [LOW, NORMAL, HIGH, URGENT]
+        customer:
+          $ref: '#/components/schemas/Customer'
+        plant:
+          $ref: '#/components/schemas/Plant'
+        financial:
+          $ref: '#/components/schemas/Financial'
+        dates:
+          $ref: '#/components/schemas/Dates'
+        product:
+          $ref: '#/components/schemas/Product'
+        quantity:
+          $ref: '#/components/schemas/Quantity'
+        production:
+          $ref: '#/components/schemas/Production'
+        quality:
+          $ref: '#/components/schemas/Quality'
+
+    Customer:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+
+    Plant:
+      type: object
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+
+    Financial:
+      type: object
+      properties:
+        totalAmount:
+          type: number
+          format: double
+        currency:
+          type: string
+
+    Dates:
+      type: object
+      properties:
+        orderDate:
+          type: string
+          format: date-time
+        requestedDeliveryDate:
+          type: string
+          format: date-time
+        confirmedDeliveryDate:
+          type: string
+          format: date-time
+
+    Product:
+      type: object
+      properties:
+        code:
+          type: string
+        description:
+          type: string
+
+    Quantity:
+      type: object
+      properties:
+        ordered:
+          type: integer
+        unit:
+          type: string
+
+    Production:
+      type: object
+      properties:
+        summary:
+          $ref: '#/components/schemas/ProductionSummary'
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductionStep'
+        metadata:
+          $ref: '#/components/schemas/SourceMetadata'
+
+    ProductionSummary:
+      type: object
+      properties:
+        totalSteps:
+          type: integer
+        completedSteps:
+          type: integer
+        inProgressSteps:
+          type: integer
+        pendingSteps:
+          type: integer
+        completionPercentage:
+          type: number
+          format: double
+
+    ProductionStep:
+      type: object
+      properties:
+        stepId:
+          type: integer
+        stepNumber:
+          type: integer
+        stepName:
+          type: string
+        status:
+          type: string
+
+    Quality:
+      type: object
+      properties:
+        summary:
+          $ref: '#/components/schemas/QualitySummary'
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/QualityCheck'
+        metadata:
+          $ref: '#/components/schemas/SourceMetadata'
+
+    QualitySummary:
+      type: object
+      properties:
+        totalChecks:
+          type: integer
+        passedChecks:
+          type: integer
+        failedChecks:
+          type: integer
+        pendingChecks:
+          type: integer
+        passRate:
+          type: number
+          format: double
+        overallStatus:
+          type: string
+          enum: [PASSED, FAILED, PENDING]
+
+    QualityCheck:
+      type: object
+      properties:
+        checkId:
+          type: integer
+        stepId:
+          type: integer
+        checkType:
+          type: string
+        result:
+          type: string
+          enum: [PASS, FAIL, PENDING]
+        severity:
+          type: string
+          enum: [CRITICAL, HIGH, NORMAL, LOW]
+
+    Warning:
+      type: object
+      properties:
+        service:
+          type: string
+        message:
+          type: string
+        severity:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    Metadata:
+      type: object
+      properties:
+        orchestrationTimestamp:
+          type: string
+          format: date-time
+        version:
+          type: string
+        integrationPattern:
+          type: string
+        partialData:
+          type: boolean
+        failedServices:
+          type: string
+
+    SourceMetadata:
+      type: object
+      properties:
+        source:
+          type: string
+        retrievedAt:
+          type: string
+          format: date-time
+
+    Links:
+      type: object
+      properties:
+        self:
+          $ref: '#/components/schemas/Link'
+        erp:
+          $ref: '#/components/schemas/Link'
+        production:
+          $ref: '#/components/schemas/Link'
+        quality:
+          $ref: '#/components/schemas/Link'
+
+    Link:
+      type: object
+      properties:
+        href:
+          type: string
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: string
+            timestamp:
+              type: string
+              format: date-time
+            path:
+              type: string
+
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      description: OAuth2 Client Credentials Flow
+      flows:
+        clientCredentials:
+          tokenUrl: https://oauth-server.apps.cluster.example.com/token
+          scopes:
+            orders:read: Lettura ordini
+            orders:write: Scrittura ordini
+
+x-ibm-configuration:
+  # API Connect Configuration
+  enforced: true
+  testable: true
+  phase: realized
+  
+  # CORS
+  cors:
+    enabled: true
+  
+  # Assembly
+  assembly:
+    execute:
+      - invoke:
+          title: Call ACE Integration Server
+          version: 2.0.0
+          verb: keep
+          target-url: http://ace-integration-server.scenario-a-demo.svc.cluster.local:7800$(request.path)
+          follow-redirects: false
+          timeout: 60
+          parameter-control:
+            type: blocklist
+          header-control:
+            type: blocklist
+          inject-proxy-headers: true
+          
+      - gatewayscript:
+          title: Add Response Headers
+          version: 2.0.0
+          source: |
+            // Add custom headers
+            context.message.header.set('X-Powered-By', 'IBM API Connect');
+            context.message.header.set('X-API-Version', '1.0.0');
+  
+  # Rate Limiting
+  rate-limit:
+    - name: default-rate-limit
+      value: 100req/1minute
+  
+  # Security
+  security:
+    - OAuth2: []
+  
+  # Properties
+  properties:
+    target-url:
+      value: http://ace-integration-server.scenario-a-demo.svc.cluster.local:7800
+      description: ACE Integration Server URL
+      encoded: false
+
+# Made with Bob

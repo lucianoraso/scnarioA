@@ -1,0 +1,32 @@
+{
+  "name": "scenario-a-integration-tests",
+  "version": "1.0.0",
+  "description": "Integration tests for IBM Cloud Pak for Integration Scenario A",
+  "main": "integration-tests.js",
+  "scripts": {
+    "test": "mocha integration-tests.js --reporter spec --timeout 30000",
+    "test:watch": "mocha integration-tests.js --reporter spec --timeout 30000 --watch",
+    "test:coverage": "nyc mocha integration-tests.js --reporter spec --timeout 30000",
+    "test:local": "cross-env ERP_SERVICE_URL=http://localhost:3001 MES_SERVICE_URL=http://localhost:3002 QMS_SERVICE_URL=http://localhost:3003 ACE_SERVER_URL=http://localhost:7800 npm test",
+    "test:openshift": "cross-env ERP_SERVICE_URL=https://erp-service-scenario-a-demo.apps.cluster.example.com MES_SERVICE_URL=https://mes-service-scenario-a-demo.apps.cluster.example.com QMS_SERVICE_URL=https://qms-service-scenario-a-demo.apps.cluster.example.com ACE_SERVER_URL=https://ace-integration-server-scenario-a-demo.apps.cluster.example.com npm test"
+  },
+  "keywords": [
+    "ibm",
+    "cloud-pak",
+    "integration",
+    "ace",
+    "api-connect",
+    "testing"
+  ],
+  "author": "IBM Cloud Pak for Integration Team",
+  "license": "IBM",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "chai": "^4.3.10",
+    "mocha": "^10.2.0"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "nyc": "^15.1.0"
+  }
+}

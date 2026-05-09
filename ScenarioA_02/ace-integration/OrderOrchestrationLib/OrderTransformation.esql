@@ -1,0 +1,340 @@
+BROKER SCHEMA com.ibm.scenario.order
+
+/**
+ * OrderTransformation Module
+ * 
+ * Questo modulo implementa le trasformazioni VETRO (Validate, Enrich, Transform, Route, Operate)
+ * per l'orchestrazione delle chiamate ai sistemi ERP, MES e QMS.
+ * 
+ * Pattern: VETRO
+ * - Validate: Validazione input request
+ * - Enrich: Arricchimento con dati da backend
+ * - Transform: Trasformazione in modello canonico
+ * - Route: Routing logico (non usato in questo scenario)
+ * - Operate: Costruzione response finale
+ */
+
+/**
+ * Valida la richiesta in ingresso
+ * Verifica che orderId sia presente e valido
+ */
+CREATE FUNCTION ValidateRequest(IN inputRoot REFERENCE, OUT isValid BOOLEAN, OUT errorMessage CHARACTER)
+BEGIN
+    DECLARE orderId CHARACTER;
+    
+    -- Estrai orderId dal path o query parameter
+    SET orderId = inputRoot.HTTPInputHeader."X-Original-HTTP-URL";
+    
+    -- Verifica presenza orderId
+    IF orderId IS NULL OR orderId = '' THEN
+        SET isValid = FALSE;
+        SET errorMessage = 'Missing required parameter: orderId';
+        RETURN;
+    END IF;
+    
+    -- Verifica formato orderId (deve iniziare con ORD-)
+    IF NOT (orderId LIKE 'ORD-%') THEN
+        SET isValid = FALSE;
+        SET errorMessage = 'Invalid orderId format. Expected: ORD-YYYY-NNN';
+        RETURN;
+    END IF;
+    
+    SET isValid = TRUE;
+    SET errorMessage = '';
+END;
+
+/**
+ * Costruisce l'URL per la chiamata al servizio ERP
+ */
+CREATE FUNCTION BuildERPUrl(IN orderId CHARACTER) RETURNS CHARACTER
+BEGIN
+    DECLARE baseUrl CHARACTER;
+    DECLARE erpService CHARACTER;
+    
+    -- Leggi configurazione da environment o usa default
+    SET erpService = COALESCE(
+        CAST(Environment.Variables.ERP_SERVICE_URL AS CHARACTER),
+        'http://erp-service.scenario-a-demo.svc.cluster.local:3001'
+    );
+    
+    SET baseUrl = erpService || '/api/v1/orders/' || orderId;
+    
+    RETURN baseUrl;
+END;
+
+/**
+ * Costruisce l'URL per la chiamata al servizio MES
+ */
+CREATE FUNCTION BuildMESUrl(IN orderId CHARACTER) RETURNS CHARACTER
+BEGIN
+    DECLARE baseUrl CHARACTER;
+    DECLARE mesService CHARACTER;
+    
+    SET mesService = COALESCE(
+        CAST(Environment.Variables.MES_SERVICE_URL AS CHARACTER),
+        'http://mes-service.scenario-a-demo.svc.cluster.local:3002'
+    );
+    
+    SET baseUrl = mesService || '/api/v1/production-steps?orderId=' || orderId;
+    
+    RETURN baseUrl;
+END;
+
+/**
+ * Costruisce l'URL per la chiamata al servizio QMS
+ * Richiede gli stepIds ottenuti dalla risposta MES
+ */
+CREATE FUNCTION BuildQMSUrl(IN stepIds CHARACTER) RETURNS CHARACTER
+BEGIN
+    DECLARE baseUrl CHARACTER;
+    DECLARE qmsService CHARACTER;
+    
+    SET qmsService = COALESCE(
+        CAST(Environment.Variables.QMS_SERVICE_URL AS CHARACTER),
+        'http://qms-service.scenario-a-demo.svc.cluster.local:3003'
+    );
+    
+    SET baseUrl = qmsService || '/api/v1/quality-checks?stepIds=' || stepIds;
+    
+    RETURN baseUrl;
+END;
+
+/**
+ * Estrae gli stepIds dalla risposta MES per la chiamata QMS
+ */
+CREATE FUNCTION ExtractStepIds(IN mesResponse REFERENCE) RETURNS CHARACTER
+BEGIN
+    DECLARE stepIds CHARACTER '';
+    DECLARE stepRef REFERENCE TO mesResponse.data.steps[1];
+    DECLARE firstStep BOOLEAN TRUE;
+    
+    WHILE LASTMOVE(stepRef) DO
+        IF NOT firstStep THEN
+            SET stepIds = stepIds || ',';
+        END IF;
+        SET stepIds = stepIds || CAST(stepRef.stepId AS CHARACTER);
+        SET firstStep = FALSE;
+        MOVE stepRef NEXTSIBLING;
+    END WHILE;
+    
+    RETURN stepIds;
+END;
+
+/**
+ * Trasforma i dati ERP nel modello canonico
+ */
+CREATE FUNCTION TransformERPData(IN erpResponse REFERENCE, OUT canonicalOrder REFERENCE)
+BEGIN
+    -- Crea struttura ordine canonico
+    CREATE FIELD canonicalOrder.order;
+    DECLARE orderRef REFERENCE TO canonicalOrder.order;
+    
+    -- Mapping campi ERP -> Canonical Model
+    SET orderRef.orderId = erpResponse.data.order_id;
+    SET orderRef.orderNumber = erpResponse.data.orderNumber;
+    SET orderRef.customer.name = erpResponse.data.customerName;
+    SET orderRef.customer.id = erpResponse.data.customer_id;
+    SET orderRef.status = erpResponse.data.status;
+    SET orderRef.priority = erpResponse.data.priority;
+    SET orderRef.plant.code = erpResponse.data.plant_code;
+    SET orderRef.plant.name = erpResponse.data.plant_name;
+    SET orderRef.financial.totalAmount = erpResponse.data.totalAmount;
+    SET orderRef.financial.currency = erpResponse.data.currency;
+    SET orderRef.dates.orderDate = erpResponse.data.order_date;
+    SET orderRef.dates.requestedDeliveryDate = erpResponse.data.requested_delivery_date;
+    SET orderRef.dates.confirmedDeliveryDate = erpResponse.data.confirmed_delivery_date;
+    SET orderRef.product.code = erpResponse.data.product_code;
+    SET orderRef.product.description = erpResponse.data.product_description;
+    SET orderRef.quantity.ordered = erpResponse.data.quantity_ordered;
+    SET orderRef.quantity.unit = erpResponse.data.unit_of_measure;
+    
+    -- Metadata
+    SET orderRef.metadata.source = 'ERP';
+    SET orderRef.metadata.retrievedAt = CURRENT_TIMESTAMP;
+END;
+
+/**
+ * Trasforma i dati MES nel modello canonico
+ */
+CREATE FUNCTION TransformMESData(IN mesResponse REFERENCE, INOUT canonicalOrder REFERENCE)
+BEGIN
+    DECLARE orderRef REFERENCE TO canonicalOrder.order;
+    DECLARE stepRef REFERENCE TO mesResponse.data.steps[1];
+    DECLARE canonicalStepRef REFERENCE;
+    DECLARE stepIndex INTEGER 1;
+    
+    -- Crea array production steps
+    CREATE FIELD orderRef.production.steps IDENTITY(JSON.Array);
+    
+    -- Aggiungi summary
+    SET orderRef.production.summary.totalSteps = mesResponse.data.totalSteps;
+    SET orderRef.production.summary.completedSteps = mesResponse.data.completedSteps;
+    SET orderRef.production.summary.inProgressSteps = mesResponse.data.inProgressSteps;
+    SET orderRef.production.summary.pendingSteps = mesResponse.data.pendingSteps;
+    
+    -- Calcola percentuale completamento
+    IF mesResponse.data.totalSteps > 0 THEN
+        SET orderRef.production.summary.completionPercentage = 
+            (mesResponse.data.completedSteps * 100.0) / mesResponse.data.totalSteps;
+    ELSE
+        SET orderRef.production.summary.completionPercentage = 0;
+    END IF;
+    
+    -- Trasforma ogni step
+    WHILE LASTMOVE(stepRef) DO
+        CREATE LASTCHILD OF orderRef.production.steps AS canonicalStepRef;
+        
+        SET canonicalStepRef.stepId = stepRef.stepId;
+        SET canonicalStepRef.stepNumber = stepRef.stepNumber;
+        SET canonicalStepRef.stepName = stepRef.stepName;
+        SET canonicalStepRef.status = stepRef.status;
+        SET canonicalStepRef.workstation.id = stepRef.workstation_id;
+        SET canonicalStepRef.workstation.name = stepRef.workstationName;
+        SET canonicalStepRef.operator.id = stepRef.operator_id;
+        SET canonicalStepRef.operator.name = stepRef.operatorName;
+        SET canonicalStepRef.quantity.planned = stepRef.quantityPlanned;
+        SET canonicalStepRef.quantity.completed = stepRef.quantityCompleted;
+        SET canonicalStepRef.quantity.rejected = stepRef.quantityRejected;
+        SET canonicalStepRef.efficiency = stepRef.efficiencyPercentage;
+        SET canonicalStepRef.dates.startDate = stepRef.startDate;
+        SET canonicalStepRef.dates.endDate = stepRef.endDate;
+        SET canonicalStepRef.duration.planned = stepRef.plannedDurationMinutes;
+        SET canonicalStepRef.duration.actual = stepRef.actualDurationMinutes;
+        
+        MOVE stepRef NEXTSIBLING;
+    END WHILE;
+    
+    -- Metadata
+    SET orderRef.production.metadata.source = 'MES';
+    SET orderRef.production.metadata.retrievedAt = CURRENT_TIMESTAMP;
+END;
+
+/**
+ * Trasforma i dati QMS nel modello canonico
+ */
+CREATE FUNCTION TransformQMSData(IN qmsResponse REFERENCE, INOUT canonicalOrder REFERENCE)
+BEGIN
+    DECLARE orderRef REFERENCE TO canonicalOrder.order;
+    DECLARE checkRef REFERENCE TO qmsResponse.data.checks[1];
+    DECLARE canonicalCheckRef REFERENCE;
+    
+    -- Crea array quality checks
+    CREATE FIELD orderRef.quality.checks IDENTITY(JSON.Array);
+    
+    -- Aggiungi summary
+    SET orderRef.quality.summary.totalChecks = qmsResponse.data.totalChecks;
+    SET orderRef.quality.summary.passedChecks = qmsResponse.data.passedChecks;
+    SET orderRef.quality.summary.failedChecks = qmsResponse.data.failedChecks;
+    SET orderRef.quality.summary.pendingChecks = qmsResponse.data.pendingChecks;
+    
+    -- Calcola percentuale successo
+    IF qmsResponse.data.totalChecks > 0 THEN
+        SET orderRef.quality.summary.passRate = 
+            (qmsResponse.data.passedChecks * 100.0) / qmsResponse.data.totalChecks;
+    ELSE
+        SET orderRef.quality.summary.passRate = 0;
+    END IF;
+    
+    -- Determina stato qualità complessivo
+    IF qmsResponse.data.failedChecks > 0 THEN
+        SET orderRef.quality.summary.overallStatus = 'FAILED';
+    ELSEIF qmsResponse.data.pendingChecks > 0 THEN
+        SET orderRef.quality.summary.overallStatus = 'PENDING';
+    ELSE
+        SET orderRef.quality.summary.overallStatus = 'PASSED';
+    END IF;
+    
+    -- Trasforma ogni check
+    WHILE LASTMOVE(checkRef) DO
+        CREATE LASTCHILD OF orderRef.quality.checks AS canonicalCheckRef;
+        
+        SET canonicalCheckRef.checkId = checkRef.checkId;
+        SET canonicalCheckRef.stepId = checkRef.stepId;
+        SET canonicalCheckRef.checkType = checkRef.checkType;
+        SET canonicalCheckRef.result = checkRef.result;
+        SET canonicalCheckRef.severity = checkRef.severity;
+        SET canonicalCheckRef.inspector.name = checkRef.inspectorName;
+        SET canonicalCheckRef.inspector.id = checkRef.inspector_id;
+        SET canonicalCheckRef.timestamp = checkRef.checkTimestamp;
+        SET canonicalCheckRef.measurements.value = checkRef.measuredValue;
+        SET canonicalCheckRef.measurements.unit = checkRef.measurementUnit;
+        SET canonicalCheckRef.measurements.tolerance.min = checkRef.minTolerance;
+        SET canonicalCheckRef.measurements.tolerance.max = checkRef.maxTolerance;
+        SET canonicalCheckRef.notes = checkRef.notes;
+        
+        MOVE checkRef NEXTSIBLING;
+    END WHILE;
+    
+    -- Metadata
+    SET orderRef.quality.metadata.source = 'QMS';
+    SET orderRef.quality.metadata.retrievedAt = CURRENT_TIMESTAMP;
+END;
+
+/**
+ * Costruisce la risposta finale consolidata
+ */
+CREATE FUNCTION BuildConsolidatedResponse(IN canonicalOrder REFERENCE, OUT finalResponse REFERENCE)
+BEGIN
+    -- Crea struttura response
+    CREATE FIELD finalResponse;
+    
+    -- Copia ordine canonico
+    SET finalResponse = canonicalOrder;
+    
+    -- Aggiungi metadata globale
+    SET finalResponse.metadata.orchestrationTimestamp = CURRENT_TIMESTAMP;
+    SET finalResponse.metadata.version = '1.0.0';
+    SET finalResponse.metadata.integrationPattern = 'Multi-System Orchestration';
+    
+    -- Aggiungi link HATEOAS
+    DECLARE orderId CHARACTER canonicalOrder.order.orderId;
+    SET finalResponse._links.self.href = '/api/v1/orders/' || orderId;
+    SET finalResponse._links.erp.href = '/api/v1/orders/' || orderId || '/erp';
+    SET finalResponse._links.production.href = '/api/v1/orders/' || orderId || '/production';
+    SET finalResponse._links.quality.href = '/api/v1/orders/' || orderId || '/quality';
+END;
+
+/**
+ * Costruisce messaggio di errore standardizzato
+ */
+CREATE FUNCTION BuildErrorResponse(
+    IN errorCode CHARACTER,
+    IN errorMessage CHARACTER,
+    IN errorDetails CHARACTER,
+    OUT errorResponse REFERENCE
+) BEGIN
+    CREATE FIELD errorResponse;
+    
+    SET errorResponse.error.code = errorCode;
+    SET errorResponse.error.message = errorMessage;
+    SET errorResponse.error.details = errorDetails;
+    SET errorResponse.error.timestamp = CURRENT_TIMESTAMP;
+    SET errorResponse.error.path = Environment.HTTP.Input.Path;
+END;
+
+/**
+ * Gestisce errori parziali (quando alcuni backend falliscono)
+ */
+CREATE FUNCTION HandlePartialFailure(
+    IN canonicalOrder REFERENCE,
+    IN failedService CHARACTER,
+    IN errorMessage CHARACTER,
+    OUT partialResponse REFERENCE
+) BEGIN
+    -- Copia dati disponibili
+    SET partialResponse = canonicalOrder;
+    
+    -- Aggiungi warning
+    CREATE FIELD partialResponse.warnings IDENTITY(JSON.Array);
+    DECLARE warningRef REFERENCE TO partialResponse.warnings;
+    
+    CREATE LASTCHILD OF warningRef AS warningRef;
+    SET warningRef.service = failedService;
+    SET warningRef.message = errorMessage;
+    SET warningRef.severity = 'WARNING';
+    SET warningRef.timestamp = CURRENT_TIMESTAMP;
+    
+    -- Aggiungi flag partial data
+    SET partialResponse.metadata.partialData = TRUE;
+    SET partialResponse.metadata.failedServices = failedService;
+END;

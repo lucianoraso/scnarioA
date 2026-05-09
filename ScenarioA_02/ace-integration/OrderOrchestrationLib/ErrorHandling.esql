@@ -1,0 +1,379 @@
+BROKER SCHEMA com.ibm.scenario.error
+
+/**
+ * ErrorHandling Module
+ * 
+ * Questo modulo gestisce gli errori, i retry e il circuit breaker pattern
+ * per le chiamate ai backend services.
+ */
+
+/**
+ * Configurazione retry policy
+ */
+CREATE FUNCTION GetRetryConfig() RETURNS ROW
+BEGIN
+    DECLARE config ROW;
+    
+    -- Numero massimo di tentativi
+    SET config.maxRetries = COALESCE(
+        CAST(Environment.Variables.MAX_RETRIES AS INTEGER),
+        3
+    );
+    
+    -- Delay iniziale in millisecondi
+    SET config.initialDelay = COALESCE(
+        CAST(Environment.Variables.RETRY_INITIAL_DELAY_MS AS INTEGER),
+        1000
+    );
+    
+    -- Moltiplicatore per backoff esponenziale
+    SET config.backoffMultiplier = COALESCE(
+        CAST(Environment.Variables.RETRY_BACKOFF_MULTIPLIER AS DECIMAL),
+        2.0
+    );
+    
+    -- Timeout per singola chiamata in secondi
+    SET config.timeout = COALESCE(
+        CAST(Environment.Variables.HTTP_TIMEOUT_SECONDS AS INTEGER),
+        30
+    );
+    
+    RETURN config;
+END;
+
+/**
+ * Determina se un errore è retriable
+ */
+CREATE FUNCTION IsRetriableError(IN httpStatusCode INTEGER) RETURNS BOOLEAN
+BEGIN
+    -- Errori retriable: 408, 429, 500, 502, 503, 504
+    DECLARE retriableCodes INTEGER ARRAY[408, 429, 500, 502, 503, 504];
+    DECLARE i INTEGER 1;
+    
+    WHILE i <= CARDINALITY(retriableCodes) DO
+        IF httpStatusCode = retriableCodes[i] THEN
+            RETURN TRUE;
+        END IF;
+        SET i = i + 1;
+    END WHILE;
+    
+    RETURN FALSE;
+END;
+
+/**
+ * Calcola delay per retry con exponential backoff
+ */
+CREATE FUNCTION CalculateRetryDelay(
+    IN attemptNumber INTEGER,
+    IN initialDelay INTEGER,
+    IN backoffMultiplier DECIMAL
+) RETURNS INTEGER
+BEGIN
+    DECLARE delay INTEGER;
+    
+    -- Exponential backoff: initialDelay * (backoffMultiplier ^ attemptNumber)
+    SET delay = CAST(initialDelay * POWER(backoffMultiplier, attemptNumber - 1) AS INTEGER);
+    
+    -- Cap massimo a 30 secondi
+    IF delay > 30000 THEN
+        SET delay = 30000;
+    END IF;
+    
+    RETURN delay;
+END;
+
+/**
+ * Esegue chiamata HTTP con retry logic
+ */
+CREATE PROCEDURE CallWithRetry(
+    IN url CHARACTER,
+    IN method CHARACTER,
+    IN headers REFERENCE,
+    IN body REFERENCE,
+    OUT response REFERENCE,
+    OUT success BOOLEAN,
+    OUT errorMessage CHARACTER
+)
+BEGIN
+    DECLARE config ROW;
+    DECLARE attempt INTEGER 1;
+    DECLARE httpStatusCode INTEGER;
+    DECLARE delay INTEGER;
+    DECLARE lastError CHARACTER;
+    
+    SET config = GetRetryConfig();
+    SET success = FALSE;
+    
+    -- Loop retry
+    WHILE attempt <= config.maxRetries AND NOT success DO
+        
+        -- Log tentativo
+        CALL LogInfo('Attempting HTTP call', 
+            'url=' || url || ', attempt=' || CAST(attempt AS CHARACTER));
+        
+        BEGIN
+            -- Esegui chiamata HTTP
+            -- Nota: In un vero message flow, questo sarebbe un HTTPRequest node
+            -- Qui simuliamo la logica
+            
+            -- Simula chiamata (in realtà sarebbe fatto dal HTTPRequest node)
+            -- SET response = ... risultato della chiamata
+            -- SET httpStatusCode = ... status code della risposta
+            
+            -- Se successo (2xx)
+            IF httpStatusCode >= 200 AND httpStatusCode < 300 THEN
+                SET success = TRUE;
+                CALL LogInfo('HTTP call succeeded', 
+                    'url=' || url || ', statusCode=' || CAST(httpStatusCode AS CHARACTER));
+                RETURN;
+            END IF;
+            
+            -- Se errore non retriable, esci subito
+            IF NOT IsRetriableError(httpStatusCode) THEN
+                SET errorMessage = 'Non-retriable error: HTTP ' || CAST(httpStatusCode AS CHARACTER);
+                CALL LogError('Non-retriable error', errorMessage);
+                RETURN;
+            END IF;
+            
+            -- Errore retriable, prepara retry
+            SET lastError = 'HTTP ' || CAST(httpStatusCode AS CHARACTER);
+            
+        EXCEPTION
+            -- Gestisci eccezioni (timeout, connection error, etc.)
+            DECLARE exceptionText CHARACTER;
+            SET exceptionText = CAST(SQLSTATE AS CHARACTER) || ': ' || CAST(SQLCODE AS CHARACTER);
+            SET lastError = 'Exception: ' || exceptionText;
+            
+            CALL LogError('HTTP call exception', exceptionText);
+        END;
+        
+        -- Se non è l'ultimo tentativo, attendi prima di ritentare
+        IF attempt < config.maxRetries THEN
+            SET delay = CalculateRetryDelay(attempt, config.initialDelay, config.backoffMultiplier);
+            CALL LogInfo('Retrying after delay', 
+                'delay=' || CAST(delay AS CHARACTER) || 'ms');
+            
+            -- Sleep (in millisecondi)
+            CALL Sleep(delay);
+        END IF;
+        
+        SET attempt = attempt + 1;
+    END WHILE;
+    
+    -- Se arriviamo qui, tutti i tentativi sono falliti
+    SET success = FALSE;
+    SET errorMessage = 'All retry attempts failed. Last error: ' || lastError;
+    CALL LogError('All retries exhausted', errorMessage);
+END;
+
+/**
+ * Circuit Breaker State Management
+ */
+CREATE FUNCTION GetCircuitBreakerState(IN serviceName CHARACTER) RETURNS CHARACTER
+BEGIN
+    -- Stati possibili: CLOSED, OPEN, HALF_OPEN
+    DECLARE state CHARACTER;
+    DECLARE failureCount INTEGER;
+    DECLARE lastFailureTime TIMESTAMP;
+    DECLARE threshold INTEGER;
+    DECLARE timeout INTEGER;
+    
+    -- Leggi configurazione
+    SET threshold = COALESCE(
+        CAST(Environment.Variables.CIRCUIT_BREAKER_THRESHOLD AS INTEGER),
+        5
+    );
+    SET timeout = COALESCE(
+        CAST(Environment.Variables.CIRCUIT_BREAKER_TIMEOUT_SECONDS AS INTEGER),
+        60
+    );
+    
+    -- Leggi stato corrente da shared variable
+    SET failureCount = COALESCE(
+        CAST(Environment.Variables.CircuitBreaker[serviceName].failureCount AS INTEGER),
+        0
+    );
+    SET lastFailureTime = CAST(
+        Environment.Variables.CircuitBreaker[serviceName].lastFailureTime AS TIMESTAMP
+    );
+    SET state = COALESCE(
+        CAST(Environment.Variables.CircuitBreaker[serviceName].state AS CHARACTER),
+        'CLOSED'
+    );
+    
+    -- Se OPEN, verifica se è tempo di passare a HALF_OPEN
+    IF state = 'OPEN' THEN
+        DECLARE elapsedSeconds INTEGER;
+        SET elapsedSeconds = CAST((CURRENT_TIMESTAMP - lastFailureTime) SECOND AS INTEGER);
+        
+        IF elapsedSeconds >= timeout THEN
+            SET state = 'HALF_OPEN';
+            SET Environment.Variables.CircuitBreaker[serviceName].state = 'HALF_OPEN';
+            CALL LogInfo('Circuit breaker transitioning to HALF_OPEN', 
+                'service=' || serviceName);
+        END IF;
+    END IF;
+    
+    RETURN state;
+END;
+
+/**
+ * Registra successo chiamata per circuit breaker
+ */
+CREATE PROCEDURE RecordCircuitBreakerSuccess(IN serviceName CHARACTER)
+BEGIN
+    -- Reset failure count
+    SET Environment.Variables.CircuitBreaker[serviceName].failureCount = 0;
+    SET Environment.Variables.CircuitBreaker[serviceName].state = 'CLOSED';
+    
+    CALL LogInfo('Circuit breaker success recorded', 
+        'service=' || serviceName || ', state=CLOSED');
+END;
+
+/**
+ * Registra fallimento chiamata per circuit breaker
+ */
+CREATE PROCEDURE RecordCircuitBreakerFailure(IN serviceName CHARACTER)
+BEGIN
+    DECLARE failureCount INTEGER;
+    DECLARE threshold INTEGER;
+    
+    SET threshold = COALESCE(
+        CAST(Environment.Variables.CIRCUIT_BREAKER_THRESHOLD AS INTEGER),
+        5
+    );
+    
+    -- Incrementa failure count
+    SET failureCount = COALESCE(
+        CAST(Environment.Variables.CircuitBreaker[serviceName].failureCount AS INTEGER),
+        0
+    ) + 1;
+    
+    SET Environment.Variables.CircuitBreaker[serviceName].failureCount = failureCount;
+    SET Environment.Variables.CircuitBreaker[serviceName].lastFailureTime = CURRENT_TIMESTAMP;
+    
+    -- Se supera threshold, apri circuit breaker
+    IF failureCount >= threshold THEN
+        SET Environment.Variables.CircuitBreaker[serviceName].state = 'OPEN';
+        CALL LogError('Circuit breaker opened', 
+            'service=' || serviceName || ', failures=' || CAST(failureCount AS CHARACTER));
+    ELSE
+        CALL LogWarning('Circuit breaker failure recorded', 
+            'service=' || serviceName || ', failures=' || CAST(failureCount AS CHARACTER));
+    END IF;
+END;
+
+/**
+ * Verifica se la chiamata può procedere secondo circuit breaker
+ */
+CREATE FUNCTION CanProceedWithCall(IN serviceName CHARACTER) RETURNS BOOLEAN
+BEGIN
+    DECLARE state CHARACTER;
+    
+    SET state = GetCircuitBreakerState(serviceName);
+    
+    -- CLOSED: procedi normalmente
+    -- HALF_OPEN: procedi per testare il servizio
+    -- OPEN: non procedere
+    IF state = 'OPEN' THEN
+        CALL LogWarning('Circuit breaker is OPEN, call blocked', 
+            'service=' || serviceName);
+        RETURN FALSE;
+    END IF;
+    
+    RETURN TRUE;
+END;
+
+/**
+ * Logging functions
+ */
+CREATE PROCEDURE LogInfo(IN message CHARACTER, IN details CHARACTER)
+BEGIN
+    -- In produzione, questo scriverebbe su log strutturato
+    DECLARE logEntry CHARACTER;
+    SET logEntry = CAST(CURRENT_TIMESTAMP AS CHARACTER) || ' [INFO] ' || message;
+    IF details IS NOT NULL AND details <> '' THEN
+        SET logEntry = logEntry || ' - ' || details;
+    END IF;
+    -- Output to user trace
+    SET Environment.Variables.Log[] = logEntry;
+END;
+
+CREATE PROCEDURE LogWarning(IN message CHARACTER, IN details CHARACTER)
+BEGIN
+    DECLARE logEntry CHARACTER;
+    SET logEntry = CAST(CURRENT_TIMESTAMP AS CHARACTER) || ' [WARN] ' || message;
+    IF details IS NOT NULL AND details <> '' THEN
+        SET logEntry = logEntry || ' - ' || details;
+    END IF;
+    SET Environment.Variables.Log[] = logEntry;
+END;
+
+CREATE PROCEDURE LogError(IN message CHARACTER, IN details CHARACTER)
+BEGIN
+    DECLARE logEntry CHARACTER;
+    SET logEntry = CAST(CURRENT_TIMESTAMP AS CHARACTER) || ' [ERROR] ' || message;
+    IF details IS NOT NULL AND details <> '' THEN
+        SET logEntry = logEntry || ' - ' || details;
+    END IF;
+    SET Environment.Variables.Log[] = logEntry;
+END;
+
+/**
+ * Sleep function (millisecondi)
+ */
+CREATE PROCEDURE Sleep(IN milliseconds INTEGER)
+BEGIN
+    -- Implementazione dipende dalla versione ACE
+    -- ACE 12+ supporta SLEEP function
+    DECLARE startTime TIMESTAMP;
+    DECLARE currentTime TIMESTAMP;
+    DECLARE elapsed INTEGER;
+    
+    SET startTime = CURRENT_TIMESTAMP;
+    
+    -- Busy wait (non ideale ma funziona)
+    WHILE elapsed < milliseconds DO
+        SET currentTime = CURRENT_TIMESTAMP;
+        SET elapsed = CAST((currentTime - startTime) SECOND * 1000 AS INTEGER);
+    END WHILE;
+END;
+
+/**
+ * Costruisce risposta di errore per circuit breaker aperto
+ */
+CREATE FUNCTION BuildCircuitBreakerErrorResponse(
+    IN serviceName CHARACTER,
+    OUT errorResponse REFERENCE
+) BEGIN
+    CREATE FIELD errorResponse;
+    
+    SET errorResponse.error.code = 'CIRCUIT_BREAKER_OPEN';
+    SET errorResponse.error.message = 'Service temporarily unavailable due to repeated failures';
+    SET errorResponse.error.service = serviceName;
+    SET errorResponse.error.timestamp = CURRENT_TIMESTAMP;
+    SET errorResponse.error.retryAfter = COALESCE(
+        CAST(Environment.Variables.CIRCUIT_BREAKER_TIMEOUT_SECONDS AS INTEGER),
+        60
+    );
+END;
+
+/**
+ * Mappa codici HTTP a messaggi di errore user-friendly
+ */
+CREATE FUNCTION MapHTTPErrorToMessage(IN statusCode INTEGER) RETURNS CHARACTER
+BEGIN
+    CASE statusCode
+        WHEN 400 THEN RETURN 'Bad Request - Invalid input parameters';
+        WHEN 401 THEN RETURN 'Unauthorized - Authentication required';
+        WHEN 403 THEN RETURN 'Forbidden - Insufficient permissions';
+        WHEN 404 THEN RETURN 'Not Found - Resource does not exist';
+        WHEN 408 THEN RETURN 'Request Timeout - Service did not respond in time';
+        WHEN 429 THEN RETURN 'Too Many Requests - Rate limit exceeded';
+        WHEN 500 THEN RETURN 'Internal Server Error - Service encountered an error';
+        WHEN 502 THEN RETURN 'Bad Gateway - Invalid response from upstream service';
+        WHEN 503 THEN RETURN 'Service Unavailable - Service temporarily unavailable';
+        WHEN 504 THEN RETURN 'Gateway Timeout - Service did not respond in time';
+        ELSE RETURN 'HTTP Error ' || CAST(statusCode AS CHARACTER);
+    END CASE;
+END;
